@@ -15,4 +15,4 @@ RUN python manage.py collectstatic --noinput || true
 
 EXPOSE 8000
 
-CMD ["gunicorn", "core.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "4"]
+CMD python manage.py migrate && python seed.py && gunicorn core.wsgi:application --bind 0.0.0.0:$PORT --workers 4
