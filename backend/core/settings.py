@@ -111,3 +111,6 @@ REST_FRAMEWORK = {
 
 # Idempotency key TTL in seconds (24 hours)
 IDEMPOTENCY_KEY_TTL = 86400
+import dj_database_url
+if os.environ.get('DATABASE_URL'):
+    DATABASES['default'] = dj_database_url.parse(os.environ.get('DATABASE_URL'))
