@@ -1,0 +1,9 @@
+Django>=4.2,<5.0
+djangorestframework>=3.14
+django-cors-headers>=4.0
+celery>=5.3
+redis>=5.0
+django-celery-beat>=2.5
+psycopg2-binary>=2.9
+whitenoise>=6.6
+gunicorn>=21.0

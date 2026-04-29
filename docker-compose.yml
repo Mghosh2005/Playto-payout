@@ -1,0 +1,96 @@
+version: '3.9'
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: playto
+      POSTGRES_USER: playto
+      POSTGRES_PASSWORD: playto
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U playto"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python seed.py &&
+             gunicorn core.wsgi:application --bind 0.0.0.0:8000 --workers 4 --timeout 60"
+    environment:
+      DB_HOST: db
+      DB_NAME: playto
+      DB_USER: playto
+      DB_PASSWORD: playto
+      REDIS_URL: redis://redis:6379/0
+      DEBUG: "False"
+      ALLOWED_HOSTS: "localhost,127.0.0.1,backend"
+      SECRET_KEY: "change-me-in-production-use-env-var"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery_worker:
+    build: ./backend
+    restart: unless-stopped
+    command: celery -A core worker --loglevel=info --concurrency=2
+    environment:
+      DB_HOST: db
+      DB_NAME: playto
+      DB_USER: playto
+      DB_PASSWORD: playto
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: "change-me-in-production-use-env-var"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery_beat:
+    build: ./backend
+    restart: unless-stopped
+    # Beat runs the periodic task scheduler (retry_stuck_payouts every 30s)
+    command: celery -A core beat --loglevel=info
+    environment:
+      DB_HOST: db
+      DB_NAME: playto
+      DB_USER: playto
+      DB_PASSWORD: playto
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: "change-me-in-production-use-env-var"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
