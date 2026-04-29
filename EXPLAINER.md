@@ -1,133 +1,138 @@
-# EXPLAINER.md
-
-> Answers to the five questions in the challenge spec.
-> This is where most candidates get filtered. Short and specific.
+# EXPLAINER.md — Playto Payout Engine
 
 ---
 
 ## 1. The Ledger
 
-**Balance calculation query (from `payouts/views.py`):**
+### Balance Calculation Query
 
 ```python
-from django.db.models import Sum, Q
-
-agg = LedgerEntry.objects.filter(merchant=locked_merchant).aggregate(
-    credits=Sum('amount_paise', filter=Q(entry_type='credit')),
-    debits=Sum('amount_paise', filter=Q(entry_type='debit'))
+# merchants/models.py — Merchant.get_balance_paise()
+result = LedgerEntry.objects.filter(merchant=self).aggregate(
+    balance=Sum(
+        'amount_paise',
+        filter=Q(entry_type=LedgerEntry.CREDIT)
+    ) - Sum(
+        'amount_paise',
+        filter=Q(entry_type=LedgerEntry.DEBIT)
+    )
 )
-available = (agg['credits'] or 0) - (agg['debits'] or 0)
 ```
 
-This emits a single SQL query:
-```sql
-SELECT
-    SUM(amount_paise) FILTER (WHERE entry_type = 'credit') AS credits,
-    SUM(amount_paise) FILTER (WHERE entry_type = 'debit')  AS debits
-FROM ledger_entries
-WHERE merchant_id = %s;
+In the payout creation view, the balance check uses a tighter version inside a locked transaction:
+
+```python
+# payouts/views.py — inside SELECT FOR UPDATE block
+agg = LedgerEntry.objects.filter(merchant=locked_merchant).aggregate(
+    credits=Sum('amount_paise', filter=Q(entry_type=LedgerEntry.CREDIT)),
+    debits=Sum('amount_paise', filter=Q(entry_type=LedgerEntry.DEBIT))
+)
+available_balance = (agg['credits'] or 0) - (agg['debits'] or 0)
 ```
 
-**Why this model:**
+### Why this model?
 
-Credits and debits are separate rows in a single `ledger_entries` table — not a mutable `balance` column on the merchant. Every financial event appends a row; nothing is ever updated or deleted. This is the double-entry pattern used by every real payment system.
+Credits and debits are separate rows in the `ledger_entries` table rather than a single mutable balance column. This is the double-entry bookkeeping pattern — it means the full history is preserved forever and the balance is always derivable from first principles. You can never have a situation where a bug silently corrupts a balance field. Every rupee is accounted for by a specific ledger row with a description and timestamp.
 
-Benefits:
-- **Auditability**: you can replay the ledger to any point in time. A mutable balance column loses history.
-- **Invariant checkability**: `SUM(credits) - SUM(debits)` must always equal the displayed balance. We can verify this at any time with a single query.
-- **No race condition on reads**: computing from the ledger inside a locked transaction gives a consistent view. A cached balance column is stale by definition.
-- **No floats**: `BigIntegerField` storing paise (integer ÷ 100 = rupees). `FloatField` loses precision on values like ₹12.30 (1230 paise stored as 1229.9999…). `DecimalField` would also work but adds ORM overhead with no benefit since our only arithmetic is integer addition and subtraction.
+Amounts are stored as `BigIntegerField` in paise (1 rupee = 100 paise). This eliminates floating point entirely. ₹500 is stored as `50000`. All arithmetic is integer arithmetic — no rounding errors, no IEEE 754 surprises.
 
 ---
 
 ## 2. The Lock
 
-**Exact code from `payouts/views.py`:**
+### Exact code that prevents concurrent overdraw
 
 ```python
+# payouts/views.py
 with transaction.atomic():
-    # LOCK: SELECT ... FOR UPDATE on the merchant row.
-    # Any other transaction that tries to SELECT FOR UPDATE on this
-    # same merchant row will BLOCK here until we commit or rollback.
+    # STEP 1: Lock the merchant row
     locked_merchant = Merchant.objects.select_for_update().get(id=merchant.id)
 
-    # Balance computed at DB level inside the locked transaction
+    # STEP 2: Compute balance at DB level
     agg = LedgerEntry.objects.filter(merchant=locked_merchant).aggregate(
-        credits=Sum('amount_paise', filter=Q(entry_type='credit')),
-        debits=Sum('amount_paise', filter=Q(entry_type='debit'))
+        credits=Sum('amount_paise', filter=Q(entry_type=LedgerEntry.CREDIT)),
+        debits=Sum('amount_paise', filter=Q(entry_type=LedgerEntry.DEBIT))
     )
-    available = (agg['credits'] or 0) - (agg['debits'] or 0)
+    available_balance = (agg['credits'] or 0) - (agg['debits'] or 0)
 
-    if available < amount_paise:
+    if available_balance < amount_paise:
         return Response({'error': 'Insufficient balance'}, status=422)
 
-    # Payout creation + ledger debit happen here, inside same transaction
-    payout = Payout.objects.create(merchant=locked_merchant, ...)
-    LedgerEntry.objects.create(entry_type='debit', ...)
-    # Transaction commits here → lock released
+    # STEP 3: Create payout + debit ledger entry atomically
+    payout = Payout.objects.create(...)
+    LedgerEntry.objects.create(entry_type=LedgerEntry.DEBIT, ...)
 ```
 
-**Database primitive: `SELECT FOR UPDATE` (PostgreSQL row-level exclusive lock)**
+### The database primitive
 
-Without this lock, the following race condition is possible:
+`SELECT FOR UPDATE` on the merchant row. When two concurrent gunicorn workers both try to process a payout for the same merchant, the first one to reach `select_for_update()` acquires a row-level exclusive lock on that merchant's DB row. The second worker blocks at that line and waits. It cannot proceed until the first transaction commits or rolls back. By the time the second worker gets the lock, the first worker has already written the debit entry — so when the second worker recomputes the balance, it sees the already-reduced amount and rejects with 422.
 
-```
-T1: reads balance = 10000          T2: reads balance = 10000
-T1: 10000 >= 6000 → OK             T2: 10000 >= 6000 → OK
-T1: creates payout, debits 6000    T2: creates payout, debits 6000
-T1: commits (balance now 4000)     T2: commits (balance now -2000) ← OVERDRAFT
-```
-
-With `SELECT FOR UPDATE`:
-```
-T1: SELECT merchant FOR UPDATE → acquires row lock
-T2: SELECT merchant FOR UPDATE → BLOCKS (waits for T1)
-T1: reads balance = 10000, OK, deducts 6000, commits → lock released
-T2: unblocks, reads balance = 4000, 4000 < 6000 → 422 Rejected
-```
-
-Python-level locks (`threading.Lock`) do not work here because requests run in separate OS processes (gunicorn workers). A Python lock in one process is invisible to another. The lock must live at the database level.
+Python-level locks (threading.Lock, etc.) do not work here because gunicorn runs multiple worker processes, not threads in the same process. A Python lock only works within a single process. PostgreSQL row-level locking works across all connections regardless of process boundaries.
 
 ---
 
 ## 3. The Idempotency
 
-**How the system recognises a key it has seen before:**
+### How the system knows it has seen a key before
 
-`IdempotencyKey` has a `unique_together = [('merchant', 'key')]` constraint enforced at the PostgreSQL level. The flow:
+```python
+# payouts/models.py
+class IdempotencyKey(models.Model):
+    merchant = models.ForeignKey('merchants.Merchant', ...)
+    key = models.CharField(max_length=255)
+    response_data = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
-1. **First request**: `get_or_create(merchant=m, key=k)` → `created=True`. We create the payout, serialize the response, store it in `response_data` on the same row. All inside `transaction.atomic()`.
+    class Meta:
+        unique_together = [('merchant', 'key')]  # DB-level enforcement
+```
 
-2. **Second request (key already committed)**: `get_or_create` → `created=False`. We return `existing_key.response_data` immediately. No new payout created.
+On every POST to `/api/v1/payouts/`, we look up `(merchant_id, idempotency_key)` in the `idempotency_keys` table with a 24-hour TTL filter:
 
-3. **Keys are scoped per merchant**: the unique constraint is on `(merchant_id, key)` not just `key`. Merchant A and Merchant B can use the same UUID key independently.
+```python
+existing_key = IdempotencyKey.objects.filter(
+    merchant=merchant,
+    key=idempotency_key,
+    created_at__gte=ttl_cutoff  # 24-hour expiry
+).first()
 
-4. **Keys expire**: we filter `created_at >= now - 24h` before lookup. An expired key is treated as unseen.
+if existing_key is not None:
+    if existing_key.response_data:
+        return Response(existing_key.response_data, status=HTTP_200_OK)
+```
 
-**What happens if the first request is still in flight when the second arrives:**
+The first successful response is serialized and stored in `response_data` (a JSONField). Subsequent calls with the same key return this stored blob verbatim — the exact same response, same status code.
 
-The `IdempotencyKey` row is inserted inside the same `atomic()` block as the payout. Two scenarios:
+### What happens if the first request is still in flight when the second arrives?
 
-- **T1 not yet committed**: T2's `get_or_create` attempts to insert the same `(merchant, key)`. PostgreSQL blocks T2 until T1 commits (row lock from the unique index). Once T1 commits, T2 gets `created=False` and returns T1's response.
+The `unique_together = [('merchant', 'key')]` constraint is enforced at the database level. If two concurrent requests both pass the initial lookup check (both find no existing key) and race to insert, only one will succeed — the other gets a `psycopg2.IntegrityError`. We catch this:
 
-- **T1 rolled back** (crash, exception after key insert but before commit): PostgreSQL rolls back T1's row. T2's `get_or_create` inserts fresh → `created=True` → proceeds as first request. Correct.
+```python
+idem_key, created = IdempotencyKey.objects.get_or_create(
+    merchant=locked_merchant,
+    key=idempotency_key,
+    defaults={'payout': payout}
+)
 
-- **True simultaneous insert race** (both reach `get_or_create` before either commits): one gets `IntegrityError` from the unique constraint. We catch that, fetch the winner's row, and return their `response_data`. See the `except IntegrityError` block in `views.py`.
+if not created:
+    raise IntegrityError("Concurrent idempotency key conflict")
+```
+
+The `IntegrityError` causes the `transaction.atomic()` block to roll back (undoing the payout creation and debit entry), and we return HTTP 409 to tell the caller to retry. This is correct behaviour — the caller should retry and will then hit the normal idempotency path.
 
 ---
 
 ## 4. The State Machine
 
-**Where `failed → completed` (and all illegal transitions) are blocked:**
-
-`payouts/models.py`, `Payout.transition_to()`:
+### Where failed-to-completed is blocked
 
 ```python
+# payouts/models.py — Payout.LEGAL_TRANSITIONS
 LEGAL_TRANSITIONS = {
     'pending':    ['processing'],
     'processing': ['completed', 'failed'],
-    'completed':  [],   # terminal — empty list means nothing is allowed
-    'failed':     [],   # terminal — empty list means nothing is allowed
+    'completed':  [],   # terminal — no transitions allowed
+    'failed':     [],   # terminal — no transitions allowed
 }
 
 def transition_to(self, new_status):
@@ -135,78 +140,75 @@ def transition_to(self, new_status):
     if new_status not in allowed:
         raise ValueError(
             f"Illegal state transition: {self.status} → {new_status}. "
-            f"Allowed from '{self.status}': {allowed}"
+            f"Allowed from {self.status}: {allowed}"
         )
     self.status = new_status
     if new_status == self.PROCESSING:
         self.processing_started_at = timezone.now()
 ```
 
-Every status change anywhere in the codebase goes through `transition_to()`. Direct assignment `payout.status = 'completed'` never appears outside this method. Illegal transitions raise `ValueError` before the model is saved — the exception propagates up through `transaction.atomic()`, rolling back any partial changes.
+`transition_to()` is the **only** place in the codebase where `payout.status` changes. Both `tasks.py` and `views.py` call it exclusively — there is no `payout.status = 'completed'` anywhere. If anything tries `failed → completed`, `LEGAL_TRANSITIONS['failed']` is an empty list, so `new_status not in []` is always True, and a `ValueError` is raised. The caller catches this and logs it.
 
-For the refund path specifically: when a payout fails, the funds are returned to the merchant balance **in the same transaction** as the state transition:
+Fund returns on failure are atomic with the state transition — both happen inside the same `transaction.atomic()` block:
 
 ```python
 with transaction.atomic():
-    payout = Payout.objects.select_for_update().get(id=payout_id)
-    payout.transition_to(Payout.FAILED)   # raises if not in PROCESSING
+    payout.transition_to(Payout.FAILED)
     payout.save(...)
-    LedgerEntry.objects.create(           # credit is atomic with state change
-        entry_type='credit',
+    LedgerEntry.objects.create(
+        entry_type=LedgerEntry.CREDIT,
         amount_paise=payout.amount_paise,
         description=f'Funds returned for failed payout {payout.id}',
         ...
     )
-    # Both writes commit together or neither does
 ```
 
-This atomicity means it is impossible for a payout to be `failed` without its refund credit appearing in the ledger, and vice versa.
+If either the state save or the ledger credit fails, both roll back. The merchant never loses funds.
 
 ---
 
 ## 5. The AI Audit
 
-**What Copilot generated when I asked for the concurrent balance check:**
+### Where AI gave subtly wrong code
+
+When implementing the idempotency key storage, the AI initially generated this pattern:
 
 ```python
-# AI output — WRONG
-def create_payout_view(request):
-    merchant = Merchant.objects.get(id=request.data['merchant_id'])
-    balance = merchant.get_balance_paise()      # Python int returned from DB query
-
-    if balance >= amount_paise:                  # check in Python
-        payout = Payout.objects.create(...)     # write in separate DB call
-        LedgerEntry.objects.create(
-            entry_type='debit',
-            amount_paise=amount_paise,
-            ...
-        )
-        return Response(...)
+# What AI gave — WRONG
+idem_key.response_data = response.data
+idem_key.save(update_fields=['response_data'])
 ```
 
-**What's wrong:**
+There were two problems here:
 
-This is a classic TOCTOU (Time of Check to Time of Use) race condition. `get_balance_paise()` executes a SELECT, returns a Python integer, then the function closes the DB connection for that query. The `if balance >= amount_paise` check and the `Payout.objects.create()` write are two completely separate database operations with no atomicity guarantee between them.
+**Problem 1:** `response` was not defined in scope — the local variable holding the serialized data was named `response_data`, not `response`. The AI confused the DRF `Response` object (which hadn't been constructed yet at that point in the code) with the serialized dict. This would have caused a `NameError` at runtime.
 
-Between those two operations, another gunicorn worker handling a concurrent request can execute its own SELECT, see the same balance, pass the same check, and proceed to debit the same funds. Both workers create payouts. Both debit. The merchant goes negative.
-
-Additionally, `get_balance_paise()` is called *before* any transaction is open. Even wrapping the `if + create` in `atomic()` would not help — the read that informed the decision happened outside the transaction boundary.
+**Problem 2:** Even if `response` had been defined, `response.data` is a DRF `ReturnDict` which contains UUID objects (from the `id` fields). PostgreSQL's JSONField cannot serialize raw UUID objects — it would throw `TypeError: Object of type UUID is not JSON serializable` when psycopg2 tried to store it.
 
 **What I replaced it with:**
 
-The read and write are fused inside a single `transaction.atomic()` block, with `SELECT FOR UPDATE` on the merchant row preceding the balance aggregate:
-
 ```python
-with transaction.atomic():
-    locked_merchant = Merchant.objects.select_for_update().get(id=merchant.id)
-    agg = LedgerEntry.objects.filter(merchant=locked_merchant).aggregate(
-        credits=Sum('amount_paise', filter=Q(entry_type='credit')),
-        debits=Sum('amount_paise', filter=Q(entry_type='debit'))
-    )
-    available = (agg['credits'] or 0) - (agg['debits'] or 0)
-    if available < amount_paise:
-        return Response({'error': 'Insufficient balance'}, status=422)
-    # payout + debit created here, still inside same transaction
+# Correct version
+response_data = serializer.data
+idem_key.response_data = json.loads(json.dumps(dict(response_data), default=str))
+idem_key.save(update_fields=['response_data'])
 ```
 
-The `SELECT FOR UPDATE` acquires an exclusive row lock on the merchant. Any concurrent transaction reaching the same `SELECT FOR UPDATE` blocks at the database level — not the Python level — until this transaction commits or rolls back. The check and the deduct are now atomic. Two concurrent requests for 6000p against a 10000p balance will serialize: one succeeds, one gets 422.
+`json.dumps(..., default=str)` converts all non-serializable objects (UUIDs, Decimals) to strings. `json.loads()` then turns it back into a plain Python dict that PostgreSQL can store cleanly. This pattern also required adding `import json` at the top of `views.py`, which the AI had omitted.
+
+The bug was caught by reading the actual error in the Django logs during testing — `NameError: name 'response' is not defined` on the first attempt, then `TypeError: Object of type UUID is not JSON serializable` after fixing the variable name.
+
+---
+
+## Architecture Summary
+
+| Concern | Approach |
+|---|---|
+| Money storage | `BigIntegerField` in paise — no floats ever |
+| Balance calculation | DB-level `SUM()` aggregation, never Python arithmetic on fetched rows |
+| Concurrency | `SELECT FOR UPDATE` on merchant row inside `transaction.atomic()` |
+| Idempotency | `unique_together` DB constraint + stored response blob + 24hr TTL |
+| State machine | `transition_to()` enforces `LEGAL_TRANSITIONS` dict — only one place status changes |
+| Fund safety | Failed payout credit happens atomically with state transition |
+| Retry | Celery beat every 30s, exponential backoff (`2^attempts`), max 3 attempts |
+| Background simulation | 70% success / 20% failure / 10% hang via `random.random()` |
