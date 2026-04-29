@@ -1,4 +1,4 @@
-const BASE = import.meta.env.VITE_API_URL || ''
+const BASE = 'https://playto-payout-jceb.onrender.com'
 
 async function apiFetch(path, options = {}) {
   const { headers, ...rest } = options
